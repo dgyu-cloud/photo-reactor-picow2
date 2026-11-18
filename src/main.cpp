@@ -1,7 +1,12 @@
 #include <Arduino.h>
 #include <Adafruit_MAX31855.h>
 #include <Adafruit_SSD1306.h>
+#include <MQTT.h>
+#include <WiFi.h>
 #include <Wire.h>
+#include <FreeRTOS.h>
+#include <queue.h>
+#include <task.h>
 #include "temperature_ui.h"
 #include "oxygen_sensor.h"
 #include "data_logger.h"
@@ -54,6 +59,108 @@ unsigned long lastDisplayMs = 0;
 bool buttonRaw = HIGH;
 bool buttonStable = HIGH;
 unsigned long buttonChangedMs = 0;
+
+namespace {
+// Set these to the WPA2 Wi-Fi network that can reach the MQTT broker.
+constexpr char STATION_SSID[] = "";
+constexpr char STATION_PASSWORD[] = "";
+constexpr bool MQTT_ENABLED = STATION_SSID[0] && STATION_PASSWORD[0];
+const IPAddress MQTT_BROKER(192, 168, 10, 2);
+constexpr uint16_t MQTT_PORT = 1883;
+constexpr char MQTT_TOPIC[] = "labauto/pp/photoreactor/t1";
+constexpr unsigned long MQTT_PUBLISH_INTERVAL_MS = 5000;
+constexpr unsigned long MQTT_RETRY_INTERVAL_MS = 10000;
+
+struct Telemetry {
+  double temperatureC;
+  double targetC;
+  double oxygenPercent;
+  double pwmPercent;
+};
+
+QueueHandle_t telemetryQueue = nullptr;
+
+void formatSensorValue(char (&value)[16], double reading) {
+  if (isfinite(reading)) {
+    const int length = snprintf(value, sizeof(value), "%.2f", reading);
+    if (length > 0 && static_cast<size_t>(length) < sizeof(value)) return;
+  }
+  strcpy(value, "null");
+}
+
+bool publishTelemetry(MQTTClient &mqtt, const Telemetry &sample) {
+  char temperature[16];
+  char oxygenValue[16];
+  formatSensorValue(temperature, sample.temperatureC);
+  formatSensorValue(oxygenValue, sample.oxygenPercent);
+
+  char payload[160];
+  const int length = snprintf(payload, sizeof(payload),
+      "{\"is_running\":true,\"temp_pv\":%s,\"temp_sv\":%.2f,"
+      "\"o2_conc\":%s,\"peltier_pwm\":%.2f}",
+      temperature, sample.targetC, oxygenValue, sample.pwmPercent);
+  return length > 0 && static_cast<size_t>(length) < sizeof(payload) &&
+         mqtt.publish(MQTT_TOPIC, payload, length, false, 1);
+}
+
+// Network joins, TCP connections and QoS 1 acknowledgements can wait here.
+void mqttTask(void *) {
+  WiFiClient transport;
+  MQTTClient mqtt(256);
+  mqtt.begin(MQTT_BROKER, MQTT_PORT, transport);
+  mqtt.setTimeout(1000);
+  WiFi.setTimeout(5000);
+
+  char clientId[24];
+  snprintf(clientId, sizeof(clientId), "pp-%s", rp2040.getChipID());
+
+  unsigned long lastPublishMs = millis();
+  unsigned long lastWifiAttemptMs = lastPublishMs - MQTT_RETRY_INTERVAL_MS;
+  unsigned long lastBrokerAttemptMs = lastWifiAttemptMs;
+  bool hadWifi = false;
+
+  for (;;) {
+    const unsigned long now = millis();
+    if (!WiFi.connected()) {
+      if (hadWifi) {
+        transport.stop();
+        hadWifi = false;
+      }
+      if (now - lastWifiAttemptMs >= MQTT_RETRY_INTERVAL_MS) {
+        Serial.println("[MQTT] Connecting to station Wi-Fi");
+        WiFi.mode(WIFI_AP_STA);
+        WiFi.begin(STATION_SSID, STATION_PASSWORD);
+        // Arduino-Pico's STA startup sets its mode flag to WIFI_STA.
+        WiFi.mode(WIFI_AP_STA);
+        lastWifiAttemptMs = millis();
+      }
+    } else {
+      if (!hadWifi) {
+        hadWifi = true;
+        lastBrokerAttemptMs = now - MQTT_RETRY_INTERVAL_MS;
+        Serial.println("[MQTT] Station Wi-Fi connected");
+      }
+      if (!mqtt.connected() && now - lastBrokerAttemptMs >= MQTT_RETRY_INTERVAL_MS) {
+        if (mqtt.connect(clientId)) {
+          Serial.println("[MQTT] Broker connected");
+        } else {
+          Serial.printf("[MQTT] Broker connection failed (%d)\n", mqtt.lastError());
+        }
+        lastBrokerAttemptMs = millis();
+      }
+      if (mqtt.connected() && mqtt.loop() &&
+          millis() - lastPublishMs >= MQTT_PUBLISH_INTERVAL_MS) {
+        Telemetry sample;
+        if (xQueuePeek(telemetryQueue, &sample, 0) == pdTRUE) {
+          lastPublishMs = millis();
+          if (!publishTelemetry(mqtt, sample)) Serial.println("[MQTT] Publish failed");
+        }
+      }
+    }
+    vTaskDelay(pdMS_TO_TICKS(20));
+  }
+}
+}  // namespace
 
 void encoderChanged() {
   const uint8_t state = (digitalRead(ENCODER_CLK_PIN) << 1) |
@@ -216,7 +323,19 @@ void setup() {
   attachInterrupt(digitalPinToInterrupt(ENCODER_DT_PIN), encoderChanged, CHANGE);
   setupDisplay();
   if (!logger.begin()) Serial.println("[LOG] LittleFS mount failed; logs disabled. No auto-format.");
+  WiFi.mode(MQTT_ENABLED ? WIFI_AP_STA : WIFI_AP);
   web.begin();
+  if (MQTT_ENABLED) {
+    telemetryQueue = xQueueCreate(1, sizeof(Telemetry));
+    if (!telemetryQueue ||
+        xTaskCreate(mqttTask, "MQTT", 1536, nullptr, tskIDLE_PRIORITY + 1, nullptr) != pdPASS) {
+      if (telemetryQueue) vQueueDelete(telemetryQueue);
+      telemetryQueue = nullptr;
+      Serial.println("[MQTT] Could not start telemetry task");
+    }
+  } else {
+    Serial.println("[MQTT] Configure STATION_SSID and STATION_PASSWORD to enable telemetry");
+  }
   lastSampleMs = millis();
 }
 
@@ -280,6 +399,10 @@ void loop() {
     sendLog(line);
   }
   // Noncritical telemetry and storage after the control calculation.
+  if (telemetryQueue) {
+    const Telemetry sample{currentTemperatureC, ui.targetC(), oxygen.percent, lastPowerPercent};
+    xQueueOverwrite(telemetryQueue, &sample);
+  }
   web.setTelemetry(currentTemperatureC, ui.targetC(), oxygen.percent,
                    lastPowerPercent, oxygen.status);
   logger.log(millis(), currentTemperatureC, ui.targetC(), oxygen.percent, lastPowerPercent);

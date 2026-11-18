@@ -12,7 +12,7 @@ class WebManager {
 public:
   WebManager(DataLogger &logger) : logger_(logger) {}
   void begin() {
-    WiFi.mode(WIFI_AP);
+    WiFi.softAPConfig(apAddress_, apAddress_, IPAddress(255, 255, 255, 0));
     if (!WiFi.softAP(AP_SSID, AP_PASSWORD)) {
       Serial.println("[WEB] AP start failed");
       return;
@@ -65,8 +65,9 @@ private:
     server_.streamFile(f, "text/csv");
     f.close();
   }
+  const IPAddress apAddress_{192, 168, 42, 1};
   DataLogger &logger_;
-  WebServer server_{80};
+  WebServer server_{apAddress_, 80};
   HTTPUpdateServer updater_;
   bool started_ = false;
   double temp_ = NAN, target_ = 0, oxygen_ = NAN, pwm_ = 0;
