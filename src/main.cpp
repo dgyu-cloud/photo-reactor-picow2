@@ -4,13 +4,11 @@
 #include <MQTT.h>
 #include <WiFi.h>
 #include <Wire.h>
-#include <FreeRTOS.h>
-#include <queue.h>
-#include <task.h>
+#include <pico/mutex.h>
 #include "temperature_ui.h"
 #include "oxygen_sensor.h"
-#include "data_logger.h"
-#include "web_manager.h"
+
+bool core1_separate_stack = true;
 
 // MAX31855 wiring: DO -> GP16, CS -> GP17, CLK -> GP18
 constexpr uint8_t MAX31855_DO_PIN = 16;
@@ -50,10 +48,7 @@ volatile int pendingEncoderSteps = 0;
 Adafruit_SSD1306 display(128, 64, &Wire, -1);
 bool displayReady = false;
 OxygenSensor oxygen;
-DataLogger logger;
-WebManager web(logger);
 double lastPowerPercent = 0.0;
-char pendingOxygenLine[65] = {};
 double currentTemperatureC = NAN;
 unsigned long lastDisplayMs = 0;
 bool buttonRaw = HIGH;
@@ -62,8 +57,8 @@ unsigned long buttonChangedMs = 0;
 
 namespace {
 // Set these to the WPA2 Wi-Fi network that can reach the MQTT broker.
-constexpr char STATION_SSID[] = "";
-constexpr char STATION_PASSWORD[] = "";
+constexpr char STATION_SSID[] = "VORONOI_7F";
+constexpr char STATION_PASSWORD[] = "qhfhshdl0!";
 constexpr bool MQTT_ENABLED = STATION_SSID[0] && STATION_PASSWORD[0];
 const IPAddress MQTT_BROKER(192, 168, 10, 2);
 constexpr uint16_t MQTT_PORT = 1883;
@@ -78,7 +73,18 @@ struct Telemetry {
   double pwmPercent;
 };
 
-QueueHandle_t telemetryQueue = nullptr;
+// Core 1 updates this snapshot. Core 0 copies it before any network operation.
+auto_init_mutex(telemetryMutex);
+Telemetry latestTelemetry{};
+bool hasTelemetry = false;
+
+WiFiClient transport;
+MQTTClient mqtt(256);
+char clientId[24];
+unsigned long lastPublishMs = 0;
+unsigned long lastWifiAttemptMs = 0;
+unsigned long lastBrokerAttemptMs = 0;
+bool hadWifi = false;
 
 void formatSensorValue(char (&value)[16], double reading) {
   if (isfinite(reading)) {
@@ -88,7 +94,7 @@ void formatSensorValue(char (&value)[16], double reading) {
   strcpy(value, "null");
 }
 
-bool publishTelemetry(MQTTClient &mqtt, const Telemetry &sample) {
+void publishTelemetry(const Telemetry &sample) {
   char temperature[16];
   char oxygenValue[16];
   formatSensorValue(temperature, sample.temperatureC);
@@ -99,66 +105,66 @@ bool publishTelemetry(MQTTClient &mqtt, const Telemetry &sample) {
       "{\"is_running\":true,\"temp_pv\":%s,\"temp_sv\":%.2f,"
       "\"o2_conc\":%s,\"peltier_pwm\":%.2f}",
       temperature, sample.targetC, oxygenValue, sample.pwmPercent);
-  return length > 0 && static_cast<size_t>(length) < sizeof(payload) &&
-         mqtt.publish(MQTT_TOPIC, payload, length, false, 1);
+  if (length <= 0 || static_cast<size_t>(length) >= sizeof(payload)) {
+    if (Serial) Serial.println("[MQTT] Publish failed: JSON formatting error");
+    return;
+  }
+
+  const bool acknowledged = mqtt.publish(MQTT_TOPIC, payload, length, false, 1);
+  if (!Serial) return;
+  if (acknowledged) {
+    Serial.printf("[MQTT] PUBACK %s %s\n", MQTT_TOPIC, payload);
+  } else {
+    Serial.printf("[MQTT] Publish failed on %s (error %d)\n", MQTT_TOPIC, mqtt.lastError());
+  }
 }
 
-// Network joins, TCP connections and QoS 1 acknowledgements can wait here.
-void mqttTask(void *) {
-  WiFiClient transport;
-  MQTTClient mqtt(256);
-  mqtt.begin(MQTT_BROKER, MQTT_PORT, transport);
-  mqtt.setTimeout(1000);
-  WiFi.setTimeout(5000);
-
-  char clientId[24];
-  snprintf(clientId, sizeof(clientId), "pp-%s", rp2040.getChipID());
-
-  unsigned long lastPublishMs = millis();
-  unsigned long lastWifiAttemptMs = lastPublishMs - MQTT_RETRY_INTERVAL_MS;
-  unsigned long lastBrokerAttemptMs = lastWifiAttemptMs;
-  bool hadWifi = false;
-
-  for (;;) {
-    const unsigned long now = millis();
-    if (!WiFi.connected()) {
-      if (hadWifi) {
-        transport.stop();
-        hadWifi = false;
-      }
-      if (now - lastWifiAttemptMs >= MQTT_RETRY_INTERVAL_MS) {
-        Serial.println("[MQTT] Connecting to station Wi-Fi");
-        WiFi.mode(WIFI_AP_STA);
-        WiFi.begin(STATION_SSID, STATION_PASSWORD);
-        // Arduino-Pico's STA startup sets its mode flag to WIFI_STA.
-        WiFi.mode(WIFI_AP_STA);
-        lastWifiAttemptMs = millis();
-      }
-    } else {
-      if (!hadWifi) {
-        hadWifi = true;
-        lastBrokerAttemptMs = now - MQTT_RETRY_INTERVAL_MS;
-        Serial.println("[MQTT] Station Wi-Fi connected");
-      }
-      if (!mqtt.connected() && now - lastBrokerAttemptMs >= MQTT_RETRY_INTERVAL_MS) {
-        if (mqtt.connect(clientId)) {
-          Serial.println("[MQTT] Broker connected");
-        } else {
-          Serial.printf("[MQTT] Broker connection failed (%d)\n", mqtt.lastError());
-        }
-        lastBrokerAttemptMs = millis();
-      }
-      if (mqtt.connected() && mqtt.loop() &&
-          millis() - lastPublishMs >= MQTT_PUBLISH_INTERVAL_MS) {
-        Telemetry sample;
-        if (xQueuePeek(telemetryQueue, &sample, 0) == pdTRUE) {
-          lastPublishMs = millis();
-          if (!publishTelemetry(mqtt, sample)) Serial.println("[MQTT] Publish failed");
-        }
-      }
+// Wi-Fi joins, TCP connections, and QoS 1 acknowledgements wait on core 0.
+void pollMqtt() {
+  const unsigned long now = millis();
+  if (!WiFi.connected()) {
+    if (hadWifi) {
+      transport.stop();
+      hadWifi = false;
+      if (Serial) Serial.println("[MQTT] Wi-Fi disconnected");
     }
-    vTaskDelay(pdMS_TO_TICKS(20));
+    if (now - lastWifiAttemptMs >= MQTT_RETRY_INTERVAL_MS) {
+      Serial.println("[MQTT] Connecting to Wi-Fi");
+      WiFi.begin(STATION_SSID, STATION_PASSWORD);
+      lastWifiAttemptMs = millis();
+    }
+    return;
   }
+
+  if (!hadWifi) {
+    hadWifi = true;
+    lastBrokerAttemptMs = now - MQTT_RETRY_INTERVAL_MS;
+    Serial.println("[MQTT] Wi-Fi connected");
+  }
+  if (!mqtt.connected()) {
+    if (now - lastBrokerAttemptMs < MQTT_RETRY_INTERVAL_MS) return;
+    const bool connected = mqtt.connect(clientId);
+    lastBrokerAttemptMs = millis();
+    if (!connected) {
+      Serial.printf("[MQTT] Broker connection failed (%d)\n", mqtt.lastError());
+      return;
+    }
+    Serial.println("[MQTT] Broker connected");
+  }
+  if (!mqtt.loop()) {
+    if (Serial) Serial.printf("[MQTT] Connection lost (error %d)\n", mqtt.lastError());
+    return;
+  }
+  if (millis() - lastPublishMs < MQTT_PUBLISH_INTERVAL_MS) return;
+
+  if (!mutex_try_enter(&telemetryMutex, nullptr)) return;
+  const Telemetry sample = latestTelemetry;
+  const bool ready = hasTelemetry;
+  mutex_exit(&telemetryMutex);
+  if (!ready) return;
+
+  lastPublishMs = millis();
+  publishTelemetry(sample);
 }
 }  // namespace
 
@@ -257,18 +263,6 @@ void setupDisplay() {
   }
 }
 
-// One USB packet at most. Drop telemetry when busy instead of delaying PID.
-bool sendLog(const char* line) {
-  if (!Serial) {
-    return false;
-  }
-  const size_t length = strlen(line);
-  if (length > 64 || Serial.availableForWrite() < static_cast<int>(length)) {
-    return false;
-  }
-  return Serial.write(reinterpret_cast<const uint8_t*>(line), length) == length;
-}
-
 double clampPower(double percent) {
   return constrain(percent, 0.0, 100.0);
 }
@@ -303,6 +297,32 @@ double calculatePid(double temperatureC, double dtSeconds) {
 
 void setup() {
   Serial.begin(115200);
+  if (!MQTT_ENABLED) return;
+
+  WiFi.mode(WIFI_STA);
+  WiFi.setTimeout(5000);
+  mqtt.begin(MQTT_BROKER, MQTT_PORT, transport);
+  mqtt.setTimeout(1000);
+  snprintf(clientId, sizeof(clientId), "pp-%s", rp2040.getChipID());
+  lastPublishMs = millis();
+  lastWifiAttemptMs = lastPublishMs - MQTT_RETRY_INTERVAL_MS;
+}
+
+void loop() {
+  if (MQTT_ENABLED) {
+    pollMqtt();
+  } else {
+    static bool monitorWasOpen = false;
+    const bool monitorOpen = static_cast<bool>(Serial);
+    if (monitorOpen && !monitorWasOpen) {
+      Serial.println("[MQTT] Configure STATION_SSID and STATION_PASSWORD to enable telemetry");
+    }
+    monitorWasOpen = monitorOpen;
+  }
+  delay(20);
+}
+
+void setup1() {
   thermocouple.begin();
 
   pinMode(MOTOR_INA_PIN, OUTPUT);
@@ -322,41 +342,13 @@ void setup() {
   attachInterrupt(digitalPinToInterrupt(ENCODER_CLK_PIN), encoderChanged, CHANGE);
   attachInterrupt(digitalPinToInterrupt(ENCODER_DT_PIN), encoderChanged, CHANGE);
   setupDisplay();
-  if (!logger.begin()) Serial.println("[LOG] LittleFS mount failed; logs disabled. No auto-format.");
-  WiFi.mode(MQTT_ENABLED ? WIFI_AP_STA : WIFI_AP);
-  web.begin();
-  if (MQTT_ENABLED) {
-    telemetryQueue = xQueueCreate(1, sizeof(Telemetry));
-    if (!telemetryQueue ||
-        xTaskCreate(mqttTask, "MQTT", 1536, nullptr, tskIDLE_PRIORITY + 1, nullptr) != pdPASS) {
-      if (telemetryQueue) vQueueDelete(telemetryQueue);
-      telemetryQueue = nullptr;
-      Serial.println("[MQTT] Could not start telemetry task");
-    }
-  } else {
-    Serial.println("[MQTT] Configure STATION_SSID and STATION_PASSWORD to enable telemetry");
-  }
   lastSampleMs = millis();
 }
 
-void loop() {
+void loop1() {
   const unsigned long now = millis();
   updateControls(now);
-  web.poll();
-  if (oxygen.update(now)) {
-    if (isfinite(oxygen.percent)) {
-      snprintf(pendingOxygenLine, sizeof(pendingOxygenLine),
-               "O2: %.2f %%\n", oxygen.percent);
-    } else {
-      snprintf(pendingOxygenLine, sizeof(pendingOxygenLine),
-               "O2 ERROR: %s\n", oxygen.status);
-    }
-  }
-  // Keep the latest O2 reading until USB accepts it, including when the
-  // monitor connects after startup. Never wait for USB in the PID loop.
-  if (pendingOxygenLine[0] && sendLog(pendingOxygenLine)) {
-    pendingOxygenLine[0] = '\0';
-  }
+  oxygen.update(now);
   const unsigned long elapsedMs = now - lastSampleMs;
   if (elapsedMs < SAMPLE_INTERVAL_MS) {
     return;
@@ -365,47 +357,19 @@ void loop() {
 
   const double temperatureC = thermocouple.readCelsius();
   currentTemperatureC = temperatureC;
-  double powerPercent = 0.0;
   if (!isfinite(temperatureC)) {
     setPower(0.0);
     integralPercent = 0.0;
     hasPreviousTemperature = false;
-    const uint8_t fault = thermocouple.readError();
-
-    if (fault & MAX31855_FAULT_OPEN) {
-      sendLog("ERROR: thermocouple open\n");
-    } else if (fault & MAX31855_FAULT_SHORT_GND) {
-      sendLog("ERROR: thermocouple short to GND\n");
-    } else if (fault & MAX31855_FAULT_SHORT_VCC) {
-      sendLog("ERROR: thermocouple short to VCC\n");
-    } else {
-      sendLog("ERROR: MAX31855 communication\n");
-    }
   } else {
-    powerPercent = calculatePid(temperatureC, elapsedMs / 1000.0);
-    setPower(powerPercent);
+    setPower(calculatePid(temperatureC, elapsedMs / 1000.0));
   }
 
-  char line[65];
-  // Report the applied target even when the thermocouple has failed.
-  const int length = isfinite(temperatureC)
-      ? snprintf(line, sizeof(line),
-          "Temperature: %.2f C, Target: %.2f C, PWM: %.1f %%\n",
-          temperatureC, ui.targetC(), powerPercent)
-      : snprintf(line, sizeof(line),
-          "Temperature: ERROR, Target: %.2f C, PWM: %.1f %%\n",
-          ui.targetC(), powerPercent);
-  if (length > 0 && static_cast<size_t>(length) < sizeof(line)) {
-    sendLog(line);
+  if (MQTT_ENABLED && mutex_try_enter(&telemetryMutex, nullptr)) {
+    latestTelemetry = {currentTemperatureC, ui.targetC(), oxygen.percent, lastPowerPercent};
+    hasTelemetry = true;
+    mutex_exit(&telemetryMutex);
   }
-  // Noncritical telemetry and storage after the control calculation.
-  if (telemetryQueue) {
-    const Telemetry sample{currentTemperatureC, ui.targetC(), oxygen.percent, lastPowerPercent};
-    xQueueOverwrite(telemetryQueue, &sample);
-  }
-  web.setTelemetry(currentTemperatureC, ui.targetC(), oxygen.percent,
-                   lastPowerPercent, oxygen.status);
-  logger.log(millis(), currentTemperatureC, ui.targetC(), oxygen.percent, lastPowerPercent);
   // I2C display update after control calculation.
   updateDisplay(millis());
 }
