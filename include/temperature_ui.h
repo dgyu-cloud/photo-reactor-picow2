@@ -4,21 +4,27 @@
 
 // Integer half-degrees keep knob increments exact.
 struct TemperatureUi {
-  static constexpr int MIN_HALF_C = -40;
-  static constexpr int MAX_HALF_C = 160;
-  int appliedHalfC = 0;
-  int draftHalfC = 0;
+  constexpr TemperatureUi(int initialHalfC, int minHalfC, int maxHalfC)
+      : appliedHalfC(initialHalfC), draftHalfC(initialHalfC),
+        minHalfC_(minHalfC), maxHalfC_(maxHalfC) {}
+
+  int appliedHalfC;
+  int draftHalfC;
   bool editing = false;
   uint32_t blinkStartedMs = 0;
 
+  constexpr void beginEdit(uint32_t now) {
+    draftHalfC = appliedHalfC;
+    editing = true;
+    blinkStartedMs = now;
+  }
+
   constexpr void turn(int steps, uint32_t now) {
     if (steps == 0) return;
-    if (!editing) draftHalfC = appliedHalfC;
-    editing = true;
+    if (!editing) beginEdit(now);
     draftHalfC += steps;
-    if (draftHalfC < MIN_HALF_C) draftHalfC = MIN_HALF_C;
-    if (draftHalfC > MAX_HALF_C) draftHalfC = MAX_HALF_C;
-    blinkStartedMs = now;
+    if (draftHalfC < minHalfC_) draftHalfC = minHalfC_;
+    if (draftHalfC > maxHalfC_) draftHalfC = maxHalfC_;
   }
 
   constexpr bool confirm() {
@@ -32,6 +38,10 @@ struct TemperatureUi {
   constexpr bool targetVisible(uint32_t now) const {
     return !editing || ((now - blinkStartedMs) / 400) % 2 == 0;
   }
+
+ private:
+  const int minHalfC_;
+  const int maxHalfC_;
 };
 
 // Decode both contacts; contact bounce retraces and cancels partial steps.

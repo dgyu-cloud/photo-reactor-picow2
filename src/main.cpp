@@ -1,12 +1,22 @@
 #include <Arduino.h>
 #include <Adafruit_MAX31855.h>
 #include <Adafruit_SSD1306.h>
+#include <LittleFS.h>
 #include <MQTT.h>
 #include <WiFi.h>
 #include <Wire.h>
+#include <atomic>
 #include <pico/mutex.h>
 #include "temperature_ui.h"
 #include "oxygen_sensor.h"
+
+// Startup defaults and selectable temperature range (degrees C).
+constexpr bool DEFAULT_EXPERIMENT_RUNNING = false;
+constexpr int DEFAULT_TARGET_C = 15;
+constexpr int MIN_TARGET_C = 5;
+constexpr int MAX_TARGET_C = 30;
+static_assert(MIN_TARGET_C <= DEFAULT_TARGET_C && DEFAULT_TARGET_C <= MAX_TARGET_C,
+              "Default target must be within the selectable range");
 
 bool core1_separate_stack = true;
 
@@ -42,7 +52,9 @@ unsigned long lastSampleMs = 0;
 double integralPercent = 0.0;
 double previousTemperatureC = 0.0;
 bool hasPreviousTemperature = false;
-TemperatureUi ui;
+TemperatureUi ui{2 * DEFAULT_TARGET_C, 2 * MIN_TARGET_C, 2 * MAX_TARGET_C};
+bool experimentSelected = false;
+bool isRunning = DEFAULT_EXPERIMENT_RUNNING;
 RotaryDecoder rotary;
 volatile int pendingEncoderSteps = 0;
 Adafruit_SSD1306 display(128, 64, &Wire, -1);
@@ -62,11 +74,14 @@ constexpr char STATION_PASSWORD[] = "qhfhshdl0!";
 constexpr bool MQTT_ENABLED = STATION_SSID[0] && STATION_PASSWORD[0];
 const IPAddress MQTT_BROKER(192, 168, 10, 2);
 constexpr uint16_t MQTT_PORT = 1883;
-constexpr char MQTT_TOPIC[] = "labauto/pp/photoreactor/t1";
+constexpr char MQTT_TOPIC_PREFIX[] = "labauto/pp/photoreactor/";
+constexpr char REACTOR_MAP_PATH[] = "/reactors.ini";
+constexpr size_t MAX_REACTOR_NAME_LENGTH = 32;
 constexpr unsigned long MQTT_PUBLISH_INTERVAL_MS = 5000;
 constexpr unsigned long MQTT_RETRY_INTERVAL_MS = 10000;
 
 struct Telemetry {
+  bool isRunning;
   double temperatureC;
   double targetC;
   double oxygenPercent;
@@ -81,10 +96,57 @@ bool hasTelemetry = false;
 WiFiClient transport;
 MQTTClient mqtt(256);
 char clientId[24];
+char mqttTopic[sizeof(MQTT_TOPIC_PREFIX) + MAX_REACTOR_NAME_LENGTH];
+const char *reactorMapStatus = "LittleFS unavailable";
 unsigned long lastPublishMs = 0;
 unsigned long lastWifiAttemptMs = 0;
 unsigned long lastBrokerAttemptMs = 0;
-bool hadWifi = false;
+std::atomic<bool> wifiConnected{false};
+
+String findReactorName(File &map, const char *chipId) {
+  constexpr char nameCharacters[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-";
+  map.setTimeout(0);
+  while (map.available()) {
+    String line = map.readStringUntil('\n');
+    if (line.startsWith("\xEF\xBB\xBF")) line.remove(0, 3);
+    line.trim();
+    if (line.startsWith("#") || line.startsWith(";")) continue;
+
+    const int separator = line.indexOf('=');
+    if (separator < 0) continue;
+    String entryId = line.substring(0, separator);
+    entryId.trim();
+    if (!entryId.equalsIgnoreCase(chipId)) continue;
+
+    String name = line.substring(separator + 1);
+    name.trim();
+    if (name.length() > 0 && name.length() <= MAX_REACTOR_NAME_LENGTH &&
+        strspn(name.c_str(), nameCharacters) == name.length()) {
+      return name;
+    }
+  }
+  return {};
+}
+
+// Resolve the topic once at boot, without formatting or writing flash.
+void configureMqttTopic(const char *chipId) {
+  String reactorName;
+  LittleFS.setConfig(LittleFSConfig(false));
+  if (LittleFS.begin()) {
+    File map = LittleFS.open(REACTOR_MAP_PATH, "r");
+    if (map) {
+      reactorName = findReactorName(map, chipId);
+      reactorMapStatus = reactorName.length() ? "reactors.ini match" : "no valid Chip ID entry";
+    } else {
+      reactorMapStatus = "reactors.ini missing";
+    }
+    map.close();
+    LittleFS.end();
+  }
+
+  const char *suffix = reactorName.length() ? reactorName.c_str() : chipId;
+  snprintf(mqttTopic, sizeof(mqttTopic), "%s%s", MQTT_TOPIC_PREFIX, suffix);
+}
 
 void formatSensorValue(char (&value)[16], double reading) {
   if (isfinite(reading)) {
@@ -102,30 +164,33 @@ void publishTelemetry(const Telemetry &sample) {
 
   char payload[160];
   const int length = snprintf(payload, sizeof(payload),
-      "{\"is_running\":true,\"temp_pv\":%s,\"temp_sv\":%.2f,"
+      "{\"is_running\":%s,\"temp_pv\":%s,\"temp_sp\":%.2f,"
       "\"o2_conc\":%s,\"peltier_pwm\":%.2f}",
-      temperature, sample.targetC, oxygenValue, sample.pwmPercent);
+      sample.isRunning ? "true" : "false", temperature, sample.targetC,
+      oxygenValue, sample.pwmPercent);
   if (length <= 0 || static_cast<size_t>(length) >= sizeof(payload)) {
     if (Serial) Serial.println("[MQTT] Publish failed: JSON formatting error");
     return;
   }
 
-  const bool acknowledged = mqtt.publish(MQTT_TOPIC, payload, length, false, 1);
+  const bool acknowledged = mqtt.publish(mqttTopic, payload, length, false, 1);
   if (!Serial) return;
   if (acknowledged) {
-    Serial.printf("[MQTT] PUBACK %s %s\n", MQTT_TOPIC, payload);
+    Serial.printf("[MQTT] PUBACK %s %s\n", mqttTopic, payload);
   } else {
-    Serial.printf("[MQTT] Publish failed on %s (error %d)\n", MQTT_TOPIC, mqtt.lastError());
+    Serial.printf("[MQTT] Publish failed on %s (error %d)\n", mqttTopic, mqtt.lastError());
   }
 }
 
 // Wi-Fi joins, TCP connections, and QoS 1 acknowledgements wait on core 0.
 void pollMqtt() {
   const unsigned long now = millis();
-  if (!WiFi.connected()) {
+  const bool hadWifi = wifiConnected.load(std::memory_order_relaxed);
+  const bool connectedToWifi = WiFi.connected();
+  wifiConnected.store(connectedToWifi, std::memory_order_relaxed);
+  if (!connectedToWifi) {
     if (hadWifi) {
       transport.stop();
-      hadWifi = false;
       if (Serial) Serial.println("[MQTT] Wi-Fi disconnected");
     }
     if (now - lastWifiAttemptMs >= MQTT_RETRY_INTERVAL_MS) {
@@ -137,7 +202,6 @@ void pollMqtt() {
   }
 
   if (!hadWifi) {
-    hadWifi = true;
     lastBrokerAttemptMs = now - MQTT_RETRY_INTERVAL_MS;
     Serial.println("[MQTT] Wi-Fi connected");
   }
@@ -182,7 +246,11 @@ void updateControls(unsigned long now) {
   const int steps = pendingEncoderSteps;
   pendingEncoderSteps = 0;
   interrupts();
-  ui.turn(steps * ENCODER_DIRECTION, now);
+  if (ui.editing) {
+    ui.turn(steps * ENCODER_DIRECTION, now);
+  } else if (steps % 2 != 0) {
+    experimentSelected = !experimentSelected;
+  }
 
   const bool raw = digitalRead(ENCODER_SW_PIN);
   if (raw != buttonRaw) {
@@ -191,10 +259,40 @@ void updateControls(unsigned long now) {
   }
   if (raw != buttonStable && now - buttonChangedMs >= BUTTON_DEBOUNCE_MS) {
     buttonStable = raw;
-    if (buttonStable == LOW && ui.confirm()) {
+    if (buttonStable != LOW) return;
+    if (ui.editing) {
       // Discard integral effort accumulated for the old target.
-      integralPercent = 0.0;
+      if (ui.draftHalfC != ui.appliedHalfC) integralPercent = 0.0;
+      ui.confirm();
+    } else if (experimentSelected) {
+      isRunning = !isRunning;
+    } else {
+      ui.beginEdit(now);
     }
+  }
+}
+
+void drawWifiIcon(bool connected) {
+  constexpr int x = 120;
+  constexpr int y = 11;
+  display.drawCircleHelper(x, y, 7, 0x03, SSD1306_WHITE);
+  display.drawCircleHelper(x, y, 4, 0x03, SSD1306_WHITE);
+  display.drawPixel(x, y - 7, SSD1306_WHITE);
+  display.drawPixel(x, y - 4, SSD1306_WHITE);
+  display.drawPixel(x, y, SSD1306_WHITE);
+  if (!connected) display.drawLine(113, 3, 127, 13, SSD1306_WHITE);
+}
+
+void drawExperimentSpinner(unsigned long now) {
+  constexpr int8_t offsets[][2] = {
+      {0, -6}, {4, -4}, {6, 0}, {4, 4}, {0, 6}, {-4, 4}, {-6, 0}, {-4, -4}
+  };
+  const unsigned int activeDot = now / DISPLAY_INTERVAL_MS % 8;
+  for (unsigned int i = 0; i < 8; ++i) {
+    const int x = 117 + offsets[i][0];
+    const int y = 53 + offsets[i][1];
+    if (i == activeDot) display.fillCircle(x, y, 2, SSD1306_WHITE);
+    else display.drawPixel(x, y, SSD1306_WHITE);
   }
 }
 
@@ -203,43 +301,46 @@ void updateDisplay(unsigned long now) {
   lastDisplayMs = now;
   display.clearDisplay();
   display.setTextColor(SSD1306_WHITE);
-  // Two columns: temperature on the left, oxygen on the right.
   display.drawFastVLine(64, 0, 64, SSD1306_WHITE);
-  const auto printTemperature = [](double temperatureC, int16_t y) {
+  display.drawFastHLine(0, 31, 128, SSD1306_WHITE);
+  display.drawRect(experimentSelected ? 64 : 0, 31,
+                   experimentSelected ? 64 : 65, 33, SSD1306_WHITE);
+  const auto printReading = [](double reading, int16_t x, int16_t y, int decimals) {
     char value[16];
-    if (isfinite(temperatureC)) {
-      snprintf(value, sizeof(value), "%.1f", temperatureC);
+    if (isfinite(reading)) {
+      snprintf(value, sizeof(value), "%.*f", decimals, reading);
     } else {
       strcpy(value, "ERROR");
     }
-    // Keep unusually large or negative readings inside the left column.
     display.setTextSize(strlen(value) <= 5 ? 2 : 1);
-    display.setCursor(0, y);
+    display.setCursor(x, y);
     display.print(value);
   };
   display.setTextSize(1);
-  display.setCursor(0, 0);
+  display.setCursor(3, 3);
   display.print("CURRENT C");
-  printTemperature(currentTemperatureC, 10);
+  printReading(currentTemperatureC, 3, 13, 1);
+
   display.setTextSize(1);
-  display.setCursor(0, 30);
+  display.setCursor(3, 35);
   display.print("TARGET C");
   if (ui.targetVisible(now)) {
-    printTemperature(ui.editing ? ui.draftHalfC * 0.5 : ui.targetC(), 40);
+    printReading(ui.editing ? ui.draftHalfC * 0.5 : ui.targetC(), 3, 45, 1);
   }
-  display.setTextSize(1);
-  display.setCursor(0, 56);
-  display.print(ui.editing ? "PRESS: SET" : "TURN: EDIT");
 
-  display.setCursor(68, 0);
+  display.setTextSize(1);
+  display.setCursor(68, 3);
   display.print("O2 (%)");
-  display.setTextSize(2);
-  display.setCursor(68, 10);
-  if (isfinite(oxygen.percent)) {
-    display.print(oxygen.percent, 2);
-  } else {
-    display.print("ERROR");
-  }
+  printReading(oxygen.percent, 68, 13, 2);
+  drawWifiIcon(wifiConnected.load(std::memory_order_relaxed));
+
+  display.setTextSize(1);
+  display.setCursor(68, 35);
+  display.print("EXPERIMENT");
+  display.setTextSize(1, 2);
+  display.setCursor(68, 45);
+  display.print(isRunning ? "ON EXP" : "OFF EXP");
+  if (isRunning) drawExperimentSpinner(now);
   display.display();
 }
 
@@ -297,28 +398,31 @@ double calculatePid(double temperatureC, double dtSeconds) {
 
 void setup() {
   Serial.begin(115200);
+  const char *chipId = rp2040.getChipID();
+  configureMqttTopic(chipId);
   if (!MQTT_ENABLED) return;
 
   WiFi.mode(WIFI_STA);
   WiFi.setTimeout(5000);
   mqtt.begin(MQTT_BROKER, MQTT_PORT, transport);
   mqtt.setTimeout(1000);
-  snprintf(clientId, sizeof(clientId), "pp-%s", rp2040.getChipID());
+  snprintf(clientId, sizeof(clientId), "pp-%s", chipId);
   lastPublishMs = millis();
   lastWifiAttemptMs = lastPublishMs - MQTT_RETRY_INTERVAL_MS;
 }
 
 void loop() {
-  if (MQTT_ENABLED) {
-    pollMqtt();
-  } else {
-    static bool monitorWasOpen = false;
-    const bool monitorOpen = static_cast<bool>(Serial);
-    if (monitorOpen && !monitorWasOpen) {
+  static bool monitorWasOpen = false;
+  const bool monitorOpen = static_cast<bool>(Serial);
+  if (monitorOpen && !monitorWasOpen) {
+    Serial.printf("[MQTT] Chip ID %s, topic %s\n", rp2040.getChipID(), mqttTopic);
+    Serial.printf("[MQTT] Topic selection: %s\n", reactorMapStatus);
+    if (!MQTT_ENABLED) {
       Serial.println("[MQTT] Configure STATION_SSID and STATION_PASSWORD to enable telemetry");
     }
-    monitorWasOpen = monitorOpen;
   }
+  monitorWasOpen = monitorOpen;
+  if (MQTT_ENABLED) pollMqtt();
   delay(20);
 }
 
@@ -366,7 +470,7 @@ void loop1() {
   }
 
   if (MQTT_ENABLED && mutex_try_enter(&telemetryMutex, nullptr)) {
-    latestTelemetry = {currentTemperatureC, ui.targetC(), oxygen.percent, lastPowerPercent};
+    latestTelemetry = {isRunning, currentTemperatureC, ui.targetC(), oxygen.percent, lastPowerPercent};
     hasTelemetry = true;
     mutex_exit(&telemetryMutex);
   }
